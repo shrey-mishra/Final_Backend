@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.api import auth_router, portfolio as portfolio_router, trading, alerts
+from app.api import auth_router, portfolio as portfolio_router, trading, live_feeds, alerts
 from app.core.database import engine
 from app.models.user import User
 from app.models.portfolio import Portfolio
@@ -10,6 +10,7 @@ app = FastAPI(title="Bitcoin Trading Backend")
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(portfolio_router, prefix="/portfolio", tags=["portfolio"])
 app.include_router(trading, prefix="/trading", tags=["trading"])
+app.include_router(live_feeds, prefix="/live", tags=["live"])  # Add this
 app.include_router(alerts, prefix="/alerts", tags=["alerts"])
 
 User.metadata.create_all(bind=engine)
@@ -30,7 +31,7 @@ def schedule_validation():
         },
         "check-price-decline": {
             "task": "app.tasks.alert_tasks.check_price_decline",
-            "schedule": crontab(minute="*/15"),  # Run every 15 minutes
+            "schedule": crontab(minute="*/15"),
             "args": ("testuser@example.com", "BTC/USDT", 0.05)
         }
     }

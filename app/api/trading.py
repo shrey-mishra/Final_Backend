@@ -2,10 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.user import User
+from app.models.preferences import Preferences
 from app.services.auth_service import get_user_by_email
 from app.core.security import get_current_user
 from app.core.config import settings
 from app.ml.lstm_model import predict_next_price
+from app.tasks.trading_tasks import execute_order_task  
 from ccxt import binance
 import json
 from cryptography.fernet import Fernet
@@ -37,7 +39,7 @@ def execute_trade(
     symbol: str = "BTC/USDT",
     side: str = "buy",
     amount: float = 0.01,
-    stop_loss: float = None,  # Optional stop-loss price
+    stop_loss: float = None,
     current_user_email: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -47,23 +49,26 @@ def execute_trade(
     if not user.binance_api_key or not user.binance_api_secret:
         raise HTTPException(status_code=400, detail="Binance API credentials not provided")
 
-    api_key = cipher.decrypt(user.binance_api_key.encode()).decode()
-    api_secret = cipher.decrypt(user.binance_api_secret.encode()).decode()
+    # Check user preferences
+    preferences = db.query(Preferences).filter(Preferences.user_id == user.id).first()
+    if not preferences:
+        raise HTTPException(status_code=404, detail="User preferences not found")
+    
+    if not preferences.auto_trade:
+        raise HTTPException(status_code=400, detail="Auto-trading is disabled for this user")
 
-    exchange = binance({
-        'apiKey': api_key,
-        'secret': api_secret,
-        'enableRateLimit': True,
-    })
-
-    # Predict next price using LSTM
     try:
         current_price, predicted_price = predict_next_price(symbol)
         print(f"DEBUG: Current price: {current_price}, Predicted price: {predicted_price}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Price prediction failed: {str(e)}")
 
-    # Decide whether to trade based on prediction
+    # Check if the price change meets the threshold
+    price_change = (predicted_price - current_price) / current_price
+    if abs(price_change) < preferences.threshold_limit:
+        print(f"DEBUG: Price change {price_change*100:.2f}% is below threshold {preferences.threshold_limit*100:.2f}%")
+        return {"message": "No trade executed - price change below threshold"}
+
     if side == "buy" and predicted_price > current_price:
         print("DEBUG: Predicted price increase - proceeding with buy")
     elif side == "sell" and predicted_price < current_price:
@@ -72,30 +77,6 @@ def execute_trade(
         print("DEBUG: No trade - prediction does not favor the action")
         return {"message": "No trade executed - prediction does not favor the action"}
 
-    try:
-        # Execute market order
-        order = exchange.create_market_order(symbol, side, amount)
-        
-        # If stop-loss is provided, create a stop-loss order
-        if stop_loss:
-            stop_side = "sell" if side == "buy" else "buy"
-            exchange.create_order(symbol, "stop_loss_limit", stop_side, amount, stop_loss, {"stopPrice": stop_loss})
-            print(f"DEBUG: Stop-loss order placed at {stop_loss}")
-
-        return {"message": f"Trade executed: {json.dumps(order)}"}
-    except Exception as e:
-        if "invalid api key" in str(e).lower() or "permission" in str(e).lower():
-            refresh_binance_token(user, db)
-            api_key = cipher.decrypt(user.binance_api_key.encode()).decode()
-            api_secret = cipher.decrypt(user.binance_api_secret.encode()).decode()
-            exchange = binance({
-                'apiKey': api_key,
-                'secret': api_secret,
-                'enableRateLimit': True,
-            })
-            order = exchange.create_market_order(symbol, side, amount)
-            if stop_loss:
-                stop_side = "sell" if side == "buy" else "buy"
-                exchange.create_order(symbol, "stop_loss_limit", stop_side, amount, stop_loss, {"stopPrice": stop_loss})
-            return {"message": f"Trade executed after refresh: {json.dumps(order)}"}
-        raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
+    # Offload the trade execution to Celery for segregated processing
+    task = execute_order_task.delay(user.id, symbol, side, amount, stop_loss)
+    return {"message": f"Trade execution task queued: {task.id}"}

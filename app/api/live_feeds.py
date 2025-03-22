@@ -31,3 +31,6 @@ def get_live_chart(symbol: str = "BTC/USDT"):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     fig = px.line(df, x="timestamp", y="close", title=f"Live Chart for {symbol}")
     return json.loads(fig.to_json())
+
+
+
